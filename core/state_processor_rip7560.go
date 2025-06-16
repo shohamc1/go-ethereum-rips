@@ -382,7 +382,6 @@ func ApplyRip7560ValidationPhases(
 	evm := vm.NewEVM(blockContext, statedb, chainConfig, cfg)
 	evm.SetTxContext(txContext)
 	rules := evm.ChainConfig().Rules(evm.Context.BlockNumber, evm.Context.Random != nil, evm.Context.Time)
-
 	statedb.Prepare(rules, *sender, evm.Context.Coinbase, &AA_ENTRY_POINT, vm.ActivePrecompiles(rules), tx.AccessList())
 
 	epc := &EntryPointCall{}
@@ -674,6 +673,8 @@ func ApplyRip7560ExecutionPhase(
 	txContext.Origin = *aatx.Sender
 	evm := vm.NewEVM(blockContext, statedb, config, cfg)
 	evm.SetTxContext(txContext)
+	rules := evm.ChainConfig().Rules(evm.Context.BlockNumber, evm.Context.Random != nil, evm.Context.Time)
+	statedb.Prepare(rules, *sender, evm.Context.Coinbase, &AA_ENTRY_POINT, vm.ActivePrecompiles(rules), vpr.Tx.AccessList())
 	st := newStateTransition(evm, nil, gp)
 	st.initialGas = math.MaxUint64
 	st.gasRemaining = math.MaxUint64
