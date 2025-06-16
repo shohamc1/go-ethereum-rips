@@ -171,64 +171,89 @@ func handleRip7560Transactions(
 	skipInvalid bool,
 	usedGas *uint64,
 ) ([]*types.Transaction, types.Receipts, []*types.Rip7560TransactionDebugInfo, []*types.Log, error) {
-	validationPhaseResults := make([]*ValidationPhaseResult, 0)
-	validatedTransactions := make([]*types.Transaction, 0)
-	validationFailureInfos := make([]*types.Rip7560TransactionDebugInfo, 0)
-	receipts := make([]*types.Receipt, 0)
+	allValidatedTransactions := make([]*types.Transaction, 0)
+	allValidationFailureInfos := make([]*types.Rip7560TransactionDebugInfo, 0)
+	allReceipts := make([]*types.Receipt, 0)
 	allLogs := make([]*types.Log, 0)
-	for i, tx := range transactions[index:] {
+
+	currentTxIndex := index
+	for currentTxIndex < len(transactions) {
+		tx := transactions[currentTxIndex]
 		if tx.Type() != types.Rip7560Type {
-			break
+			currentTxIndex++
+			continue
 		}
 
-		statedb.SetTxContext(tx.Hash(), index+i)
-		beforeValidationSnapshotId := statedb.Snapshot()
-		vpr, vpe := ApplyRip7560ValidationPhases(chainConfig, bc, coinbase, gp, statedb, header, tx, cfg)
-		if vpe != nil {
-			if skipInvalid {
-				log.Error("Validation failed during block building, should not happen, skipping transaction", "error", vpe)
-				debugInfo := &types.Rip7560TransactionDebugInfo{
-					TxHash:           tx.Hash(),
-					RevertData:       vpe.Error(),
-					FrameReverted:    false,
-					RevertEntityName: "n/a",
-				}
-				validationFailureInfos = append(validationFailureInfos, debugInfo)
-				var vpeCast *ValidationPhaseError
-				if errors.As(vpe, &vpeCast) {
-					debugInfo.RevertData = vpeCast.reason
-					debugInfo.FrameReverted = vpeCast.frameReverted
-					debugInfo.RevertEntityName = ""
-					if vpeCast.revertEntityName != nil {
-						debugInfo.RevertEntityName = *vpeCast.revertEntityName
-					}
-				}
-				statedb.RevertToSnapshot(beforeValidationSnapshotId)
-				continue
+		validationPhaseResults := make([]*ValidationPhaseResult, 0)
+		validatedTransactionsInGroup := make([]*types.Transaction, 0)
+		validationFailureInfosInGroup := make([]*types.Rip7560TransactionDebugInfo, 0)
+
+		// Phase 1: Validation for the current batch
+		batchEndTxIndex := currentTxIndex
+		for txIndex := currentTxIndex; txIndex < len(transactions); txIndex++ {
+			currentTx := transactions[txIndex]
+			if currentTx.Type() != types.Rip7560Type {
+				break // End of batch
 			}
-			return nil, nil, nil, nil, vpe
+
+			statedb.SetTxContext(currentTx.Hash(), txIndex)
+			beforeValidationSnapshotId := statedb.Snapshot()
+			vpr, vpe := ApplyRip7560ValidationPhases(chainConfig, bc, coinbase, gp, statedb, header, currentTx, cfg)
+			if vpe != nil {
+				if skipInvalid {
+					log.Error("Validation failed during block building, should not happen, skipping transaction", "error", vpe)
+					debugInfo := &types.Rip7560TransactionDebugInfo{
+						TxHash:           currentTx.Hash(),
+						RevertData:       vpe.Error(),
+						FrameReverted:    false,
+						RevertEntityName: "n/a",
+					}
+					validationFailureInfosInGroup = append(validationFailureInfosInGroup, debugInfo)
+					var vpeCast *ValidationPhaseError
+					if errors.As(vpe, &vpeCast) {
+						debugInfo.RevertData = vpeCast.reason
+						debugInfo.FrameReverted = vpeCast.frameReverted
+						debugInfo.RevertEntityName = ""
+						if vpeCast.revertEntityName != nil {
+							debugInfo.RevertEntityName = *vpeCast.revertEntityName
+						}
+					}
+					statedb.RevertToSnapshot(beforeValidationSnapshotId)
+					batchEndTxIndex = txIndex + 1
+					continue
+				}
+				return nil, nil, nil, nil, vpe
+			}
+			vpr.TxIndex = txIndex
+			validationPhaseResults = append(validationPhaseResults, vpr)
+			validatedTransactionsInGroup = append(validatedTransactionsInGroup, currentTx)
+			batchEndTxIndex = txIndex + 1
 		}
-		validationPhaseResults = append(validationPhaseResults, vpr)
-		validatedTransactions = append(validatedTransactions, tx)
 
-		// This is the line separating the Validation and Execution phases
-		// It should be separated to implement the mempool-friendly AA RIP-7711
-		// for i, vpr := range validationPhaseResults
+		// Phase 2: Execution for the current batch
+		receiptsInGroup := make([]*types.Receipt, len(validationPhaseResults))
+		logsInGroup := make([]*types.Log, 0)
+		for idx, vpr := range validationPhaseResults {
+			statedb.SetTxContext(vpr.Tx.Hash(), vpr.TxIndex)
 
-		// TODO: this will miss all validation phase events - pass in 'vpr'
-		// statedb.SetTxContext(vpr.Tx.Hash(), i)
+			receipt, err := ApplyRip7560ExecutionPhase(chainConfig, vpr, bc, coinbase, gp, statedb, header, cfg, usedGas)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			statedb.Finalise(true)
 
-		receipt, err := ApplyRip7560ExecutionPhase(chainConfig, vpr, bc, coinbase, gp, statedb, header, cfg, usedGas)
-
-		if err != nil {
-			return nil, nil, nil, nil, err
+			receiptsInGroup[idx] = receipt
+			logsInGroup = append(logsInGroup, receipt.Logs...)
 		}
-		statedb.Finalise(true)
 
-		receipts = append(receipts, receipt)
-		allLogs = append(allLogs, receipt.Logs...)
+		allValidatedTransactions = append(allValidatedTransactions, validatedTransactionsInGroup...)
+		allValidationFailureInfos = append(allValidationFailureInfos, validationFailureInfosInGroup...)
+		allReceipts = append(allReceipts, receiptsInGroup...)
+		allLogs = append(allLogs, logsInGroup...)
+
+		currentTxIndex = batchEndTxIndex
 	}
-	return validatedTransactions, receipts, validationFailureInfos, allLogs, nil
+	return allValidatedTransactions, allReceipts, allValidationFailureInfos, allLogs, nil
 }
 
 func BuyGasRip7560Transaction(
